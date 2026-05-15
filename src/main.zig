@@ -33,7 +33,10 @@ pub fn main(init: std.process.Init) !void {
         .arena = arena,
     };
 
-    const port: u16 = 8080;
+    const port: u16 = if (init.environ_map.get("PORT")) |s|
+        std.fmt.parseInt(u16, s, 10) catch 8080
+    else
+        8080;
     const address = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(port) };
     var tcp_server = try address.listen(io, .{ .reuse_address = true });
     defer tcp_server.deinit(io);
