@@ -3,12 +3,28 @@ const net = std.Io.net;
 const http = std.http;
 
 const max_body_size = 4 * 1024 * 1024; // 4MB cap on captured bodies
+const max_requests = 100; // max requests kept in memory and shown in UI
 
 const favicon = @embedFile("favicon.ico");
 
 const StoredHeader = struct {
     name: []const u8,
     value: []const u8,
+};
+
+// On-disk serialization types (NDJSON log, one JSON object per line).
+// Body is base64-encoded so binary payloads survive the round-trip.
+const SerHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+const SerializedRequest = struct {
+    id: u32,
+    method: []const u8,
+    path: []const u8,
+    headers: []SerHeader,
+    body: []const u8, // base64-encoded
+    is_json: bool,
 };
 
 const CapturedRequest = struct {
@@ -22,7 +38,10 @@ const CapturedRequest = struct {
 };
 
 const State = struct {
+    io: std.Io,
     arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    data_path: []const u8,
     requests: std.ArrayList(CapturedRequest) = .empty,
     next_id: u32 = 0,
 };
@@ -30,9 +49,22 @@ const State = struct {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
+    const gpa = init.gpa;
+
+    const data_path: []const u8 = if (init.environ_map.get("POSTBIN_DATA")) |p|
+        try arena.dupe(u8, p)
+    else
+        "postbin.ndjson";
 
     var state = State{
+        .io = io,
         .arena = arena,
+        .gpa = gpa,
+        .data_path = data_path,
+    };
+
+    loadRequests(&state) catch |err| {
+        std.log.warn("could not load existing requests from '{s}': {s}", .{ data_path, @errorName(err) });
     };
 
     const port: u16 = if (init.environ_map.get("PORT")) |s|
@@ -132,7 +164,7 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
     const id = state.next_id;
     state.next_id += 1;
 
-    try state.requests.append(arena, .{
+    const new_req = CapturedRequest{
         .id = id,
         .method = method,
         .path = path,
@@ -140,7 +172,16 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
         .body = body,
         .pretty_body = pretty_body,
         .is_json = is_json,
-    });
+    };
+
+    appendRequestToLog(state, &new_req) catch |err| {
+        std.log.warn("could not write request to log: {s}", .{@errorName(err)});
+    };
+
+    try state.requests.append(arena, new_req);
+    while (state.requests.items.len > max_requests) {
+        _ = state.requests.orderedRemove(0);
+    }
 
     // Terminal log
     std.log.info("[#{d}] {s} {s}  ({d} bytes)", .{ id, method, path, body.len });
@@ -324,9 +365,118 @@ fn prettyJson(arena: std.mem.Allocator, input: []const u8) ![]const u8 {
     return try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
 }
 
+// ---- Disk persistence ----------------------------------------------------
+
+fn loadRequests(state: *State) !void {
+    const contents = std.Io.Dir.cwd().readFileAlloc(
+        state.io,
+        state.data_path,
+        state.gpa,
+        .unlimited,
+    ) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer state.gpa.free(contents);
+
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r");
+        if (trimmed.len == 0) continue;
+
+        const req = parseStoredRequest(state.arena, state.gpa, trimmed) catch |err| {
+            std.log.warn("skipping malformed log line: {s}", .{@errorName(err)});
+            continue;
+        };
+        try state.requests.append(state.arena, req);
+        if (req.id >= state.next_id) state.next_id = req.id + 1;
+    }
+
+    while (state.requests.items.len > max_requests) {
+        _ = state.requests.orderedRemove(0);
+    }
+}
+
+fn parseStoredRequest(arena: std.mem.Allocator, gpa: std.mem.Allocator, line: []const u8) !CapturedRequest {
+    const parsed = try std.json.parseFromSlice(SerializedRequest, gpa, line, .{});
+    defer parsed.deinit();
+    const v = parsed.value;
+
+    const b64 = std.base64.standard;
+    const body_len = try b64.Decoder.calcSizeForSlice(v.body);
+    const body = try arena.alloc(u8, body_len);
+    try b64.Decoder.decode(body, v.body);
+
+    const is_json = v.is_json;
+    const pretty_body = if (is_json) prettyJson(arena, body) catch body else body;
+
+    var header_list: std.ArrayList(StoredHeader) = .empty;
+    for (v.headers) |h| {
+        try header_list.append(arena, .{
+            .name = try arena.dupe(u8, h.name),
+            .value = try arena.dupe(u8, h.value),
+        });
+    }
+
+    return .{
+        .id = v.id,
+        .method = try arena.dupe(u8, v.method),
+        .path = try arena.dupe(u8, v.path),
+        .headers = try header_list.toOwnedSlice(arena),
+        .body = body,
+        .pretty_body = pretty_body,
+        .is_json = is_json,
+    };
+}
+
+fn appendRequestToLog(state: *const State, req: *const CapturedRequest) !void {
+    const b64 = std.base64.standard;
+    const b64_len = b64.Encoder.calcSize(req.body.len);
+    const b64_body = try state.gpa.alloc(u8, b64_len);
+    defer state.gpa.free(b64_body);
+    _ = b64.Encoder.encode(b64_body, req.body);
+
+    const ser_headers = try state.gpa.alloc(SerHeader, req.headers.len);
+    defer state.gpa.free(ser_headers);
+    for (req.headers, 0..) |h, i| ser_headers[i] = .{ .name = h.name, .value = h.value };
+
+    const ser = SerializedRequest{
+        .id = req.id,
+        .method = req.method,
+        .path = req.path,
+        .headers = ser_headers,
+        .body = b64_body,
+        .is_json = req.is_json,
+    };
+
+    const json_line = try std.json.Stringify.valueAlloc(state.gpa, ser, .{});
+    defer state.gpa.free(json_line);
+
+    const dir = std.Io.Dir.cwd();
+    const file = try dir.createFile(state.io, state.data_path, .{ .truncate = false });
+    defer file.close(state.io);
+
+    const file_len = try file.length(state.io);
+    var write_buf: [4096]u8 = undefined;
+    var fw = std.Io.File.Writer.init(file, state.io, &write_buf);
+    fw.pos = file_len;
+    try fw.interface.writeAll(json_line);
+    try fw.interface.writeByte('\n');
+    try fw.interface.flush();
+}
+
 // ---- Tests ---------------------------------------------------------------
 
 const testing = std.testing;
+
+fn testState(arena: std.mem.Allocator) State {
+    return .{
+        .io = std.testing.io,
+        .arena = arena,
+        .gpa = testing.allocator,
+        .data_path = "", // empty → appendRequestToLog fails silently, no disk I/O
+    };
+}
 
 fn testRequest(state: *State, raw: []const u8) !std.Io.Writer.Allocating {
     var reader = std.Io.Reader.fixed(raw);
@@ -385,7 +535,7 @@ test "writeHtmlEscaped: special characters" {
 test "GET / returns 200 with HTML" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var state = State{ .arena = arena.allocator() };
+    var state = testState(arena.allocator());
     var out = try testRequest(&state, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     defer out.deinit();
     const resp = out.written();
@@ -396,7 +546,7 @@ test "GET / returns 200 with HTML" {
 test "GET /favicon.ico returns image/x-icon" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var state = State{ .arena = arena.allocator() };
+    var state = testState(arena.allocator());
     var out = try testRequest(&state, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
     defer out.deinit();
     const resp = out.written();
@@ -407,7 +557,7 @@ test "GET /favicon.ico returns image/x-icon" {
 test "POST captures method, path, and body" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var state = State{ .arena = arena.allocator() };
+    var state = testState(arena.allocator());
     const raw =
         "POST /webhook HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
@@ -427,7 +577,7 @@ test "POST captures method, path, and body" {
 test "POST with JSON content-type is detected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var state = State{ .arena = arena.allocator() };
+    var state = testState(arena.allocator());
     const raw =
         "POST /api HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
