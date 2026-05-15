@@ -4,6 +4,8 @@ const http = std.http;
 
 const max_body_size = 4 * 1024 * 1024; // 4MB cap on captured bodies
 
+const favicon = @embedFile("favicon.ico");
+
 const StoredHeader = struct {
     name: []const u8,
     value: []const u8,
@@ -86,9 +88,20 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
     const is_ui = req.head.method == .GET and
         (std.mem.eql(u8, req.head.target, "/") or
         std.mem.startsWith(u8, req.head.target, "/?"));
+    const is_favicon = req.head.method == .GET and
+        std.mem.eql(u8, req.head.target, "/favicon.ico");
 
     if (is_ui) {
         return serveUI(arena, state, req);
+    }
+    if (is_favicon) {
+        return req.respond(favicon, .{
+            .status = .ok,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "image/x-icon" },
+                .{ .name = "cache-control", .value = "public, max-age=86400" },
+            },
+        });
     }
 
     // Copy head data now — body reading will invalidate head string pointers
