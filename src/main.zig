@@ -2,8 +2,8 @@ const std = @import("std");
 const net = std.Io.net;
 const http = std.http;
 
-const max_body_size = 4 * 1024 * 1024; // 4MB cap on captured bodies
-const max_requests = 100; // max requests kept in memory and shown in UI
+const max_body_size = 4 * 1024 * 1024;
+const max_requests = 100;
 
 const favicon = @embedFile("favicon.ico");
 
@@ -12,14 +12,13 @@ const StoredHeader = struct {
     value: []const u8,
 };
 
-// On-disk serialization types (NDJSON log, one JSON object per line).
-// Body is base64-encoded so binary payloads survive the round-trip.
 const SerHeader = struct {
     name: []const u8,
     value: []const u8,
 };
 const SerializedRequest = struct {
     id: u32,
+    bin_id: []const u8,
     method: []const u8,
     path: []const u8,
     headers: []SerHeader,
@@ -29,6 +28,7 @@ const SerializedRequest = struct {
 
 const CapturedRequest = struct {
     id: u32,
+    bin_id: []const u8,
     method: []const u8,
     path: []const u8,
     headers: []const StoredHeader,
@@ -76,7 +76,6 @@ pub fn main(init: std.process.Init) !void {
     defer tcp_server.deinit(io);
 
     std.log.info("PostBin listening on http://localhost:{d}/", .{port});
-    std.log.info("Send requests to any path except GET / to capture them.", .{});
 
     while (true) {
         const stream = tcp_server.accept(io) catch |err| {
@@ -113,20 +112,35 @@ fn handleConn(io: std.Io, state: *State, stream: net.Stream) !void {
     }
 }
 
-fn handleRequest(state: *State, req: *http.Server.Request) !void {
-    const arena = state.arena;
-
-    // Determine if this is a UI viewer request before copying
-    const is_ui = req.head.method == .GET and
-        (std.mem.eql(u8, req.head.target, "/") or
-        std.mem.startsWith(u8, req.head.target, "/?"));
-    const is_favicon = req.head.method == .GET and
-        std.mem.eql(u8, req.head.target, "/favicon.ico");
-
-    if (is_ui) {
-        return serveUI(arena, state, req);
+fn isValidBinId(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, i| {
+        switch (i) {
+            8, 13, 18, 23 => if (c != '-') return false,
+            else => if (!std.ascii.isHex(c)) return false,
+        }
     }
-    if (is_favicon) {
+    return true;
+}
+
+// Returns a slice of target[1..37] when target starts with /<uuid> (followed by nothing, /, or ?).
+fn extractBinId(target: []const u8) ?[]const u8 {
+    if (target.len < 37) return null;
+    if (target[0] != '/') return null;
+    const candidate = target[1..37];
+    if (!isValidBinId(candidate)) return null;
+    if (target.len > 37 and target[37] != '/' and target[37] != '?') return null;
+    return candidate;
+}
+
+fn handleRequest(state: *State, req: *http.Server.Request) !void {
+    const target = req.head.target;
+    const method = req.head.method;
+
+    if (method == .GET and (std.mem.eql(u8, target, "/") or std.mem.startsWith(u8, target, "/?"))) {
+        return serveLanding(state.arena, state, req);
+    }
+    if (method == .GET and std.mem.eql(u8, target, "/favicon.ico")) {
         return req.respond(favicon, .{
             .status = .ok,
             .extra_headers = &.{
@@ -136,13 +150,36 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
         });
     }
 
-    // Copy head data now — body reading will invalidate head string pointers
+    if (extractBinId(target)) |bin_id| {
+        const after_uuid = target[37..];
+        const is_bin_view = method == .GET and
+            (after_uuid.len == 0 or
+            after_uuid[0] == '?' or
+            std.mem.eql(u8, after_uuid, "/") or
+            std.mem.startsWith(u8, after_uuid, "/?"));
+        if (is_bin_view) {
+            return serveBinUI(state.arena, state, bin_id, req);
+        }
+        return captureRequest(state, bin_id, req);
+    }
+
+    try req.respond("Not Found\n", .{
+        .status = .not_found,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/plain" },
+        },
+    });
+}
+
+fn captureRequest(state: *State, bin_id: []const u8, req: *http.Server.Request) !void {
+    const arena = state.arena;
+
     const method = @tagName(req.head.method);
     const path = try arena.dupe(u8, req.head.target);
     const content_type_raw = req.head.content_type;
     const content_type = if (content_type_raw) |ct| try arena.dupe(u8, ct) else null;
+    const bin_id_owned = try arena.dupe(u8, bin_id);
 
-    // Collect headers
     var header_list: std.ArrayList(StoredHeader) = .empty;
     var hit = req.iterateHeaders();
     while (hit.next()) |h| {
@@ -152,12 +189,10 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
         });
     }
 
-    // Read body — this invalidates head string pointers
     var transfer_buf: [4096]u8 = undefined;
     const body_reader = try req.readerExpectContinue(&transfer_buf);
     const body = try body_reader.allocRemaining(arena, .limited(max_body_size));
 
-    // Detect JSON and pretty-print
     const is_json = looksLikeJson(content_type, body);
     const pretty_body = if (is_json) prettyJson(arena, body) catch body else body;
 
@@ -166,6 +201,7 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
 
     const new_req = CapturedRequest{
         .id = id,
+        .bin_id = bin_id_owned,
         .method = method,
         .path = path,
         .headers = try header_list.toOwnedSlice(arena),
@@ -179,12 +215,9 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
     };
 
     try state.requests.append(arena, new_req);
-    while (state.requests.items.len > max_requests) {
-        _ = state.requests.orderedRemove(0);
-    }
+    capBin(state, bin_id_owned);
 
-    // Terminal log
-    std.log.info("[#{d}] {s} {s}  ({d} bytes)", .{ id, method, path, body.len });
+    std.log.info("[#{d}] [{s}] {s} {s}  ({d} bytes)", .{ id, bin_id_owned[0..8], method, path, body.len });
     for (state.requests.items[state.requests.items.len - 1].headers) |h| {
         std.log.info("  {s}: {s}", .{ h.name, h.value });
     }
@@ -205,9 +238,104 @@ fn handleRequest(state: *State, req: *http.Server.Request) !void {
     });
 }
 
-fn serveUI(arena: std.mem.Allocator, state: *const State, req: *http.Server.Request) !void {
+fn capBin(state: *State, bin_id: []const u8) void {
+    var count: usize = 0;
+    for (state.requests.items) |r| {
+        if (std.mem.eql(u8, r.bin_id, bin_id)) count += 1;
+    }
+    var i: usize = 0;
+    while (count > max_requests) {
+        if (i >= state.requests.items.len) break;
+        if (std.mem.eql(u8, state.requests.items[i].bin_id, bin_id)) {
+            _ = state.requests.orderedRemove(i);
+            count -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn serveLanding(arena: std.mem.Allocator, state: *const State, req: *http.Server.Request) !void {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
+
+    try w.writeAll(
+        \\<!DOCTYPE html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="UTF-8">
+        \\<meta name="viewport" content="width=device-width,initial-scale=1">
+        \\<title>PostBin</title>
+        \\<style>
+        \\*{box-sizing:border-box;margin:0;padding:0}
+        \\body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f0f2f5;color:#333;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh}
+        \\.card{background:#fff;border-radius:12px;padding:40px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,.1);max-width:500px;width:90%}
+        \\h1{font-size:2.2em;color:#1a1a2e;margin-bottom:8px;font-weight:800}
+        \\p{color:#888;margin-bottom:28px;font-size:.95em}
+        \\button{background:#e94560;color:#fff;border:none;padding:12px 28px;border-radius:8px;font-size:1em;font-weight:600;cursor:pointer}
+        \\button:hover{background:#c73652}
+        \\.bins{margin-top:28px;text-align:left}
+        \\.bins-title{font-size:.75em;text-transform:uppercase;color:#aaa;letter-spacing:.06em;margin-bottom:10px;font-weight:700}
+        \\.bin-link{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:6px;background:#f7f7f7;margin-bottom:6px;text-decoration:none;color:#333;font-family:monospace;font-size:.82em}
+        \\.bin-link:hover{background:#eee}
+        \\.bin-count{background:#e94560;color:#fff;border-radius:10px;padding:2px 8px;font-size:.75em;font-family:sans-serif;font-weight:600}
+        \\</style>
+        \\</head><body>
+        \\<div class="card">
+        \\<h1>PostBin</h1>
+        \\<p>Local HTTP request inspector</p>
+        \\<button onclick="window.location='/'+crypto.randomUUID()">Create New Bin</button>
+    );
+
+    // Collect unique bin IDs with request counts
+    var bin_ids: std.ArrayList([]const u8) = .empty;
+    var bin_counts: std.ArrayList(usize) = .empty;
+    for (state.requests.items) |r| {
+        var found_idx: ?usize = null;
+        for (bin_ids.items, 0..) |b, bi| {
+            if (std.mem.eql(u8, b, r.bin_id)) {
+                found_idx = bi;
+                break;
+            }
+        }
+        if (found_idx) |bi| {
+            bin_counts.items[bi] += 1;
+        } else {
+            try bin_ids.append(arena, r.bin_id);
+            try bin_counts.append(arena, 1);
+        }
+    }
+
+    if (bin_ids.items.len > 0) {
+        try w.writeAll("<div class=\"bins\"><div class=\"bins-title\">Active bins</div>");
+        for (bin_ids.items, 0..) |b, bi| {
+            try w.print(
+                "<a class=\"bin-link\" href=\"/{s}\">{s}<span class=\"bin-count\">{d}</span></a>",
+                .{ b, b, bin_counts.items[bi] },
+            );
+        }
+        try w.writeAll("</div>");
+    }
+
+    try w.writeAll("</div></body></html>");
+    try w.flush();
+
+    try req.respond(out.written(), .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        },
+    });
+}
+
+fn serveBinUI(arena: std.mem.Allocator, state: *const State, bin_id: []const u8, req: *http.Server.Request) !void {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+
+    var count: usize = 0;
+    for (state.requests.items) |r| {
+        if (std.mem.eql(u8, r.bin_id, bin_id)) count += 1;
+    }
 
     try w.writeAll(
         \\<!DOCTYPE html>
@@ -221,8 +349,11 @@ fn serveUI(arena: std.mem.Allocator, state: *const State, req: *http.Server.Requ
         \\*{box-sizing:border-box;margin:0;padding:0}
         \\body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f0f2f5;color:#333}
         \\.topbar{background:#1a1a2e;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:12px}
+        \\.topbar a{color:#aaa;text-decoration:none;font-size:.85em}
+        \\.topbar a:hover{color:#fff}
         \\.topbar h1{font-size:1.3em;font-weight:700;letter-spacing:.5px}
         \\.badge{background:#e94560;padding:3px 10px;border-radius:12px;font-size:.8em;font-weight:600}
+        \\.bin-id{font-family:monospace;font-size:.75em;color:#aaa}
         \\.hint{margin-left:auto;color:#aaa;font-size:.8em}
         \\.container{max-width:1000px;margin:0 auto;padding:20px 16px}
         \\.empty{text-align:center;padding:80px 20px;color:#888}
@@ -250,27 +381,33 @@ fn serveUI(arena: std.mem.Allocator, state: *const State, req: *http.Server.Requ
 
     try w.print(
         \\<div class="topbar">
-        \\<h1>PostBin</h1>
+        \\<a href="/">&#8592; PostBin</a>
+        \\<h1>Bin</h1>
         \\<span class="badge">{d} request{s}</span>
-        \\<span class="hint">auto-refresh every 5 s</span>
+        \\<span class="bin-id">{s}</span>
+        \\<span class="hint">auto-refresh 5 s</span>
         \\</div>
         \\<div class="container">
-    , .{ state.requests.items.len, if (state.requests.items.len == 1) "" else "s" });
+    , .{ count, if (count == 1) "" else "s", bin_id });
 
-    if (state.requests.items.len == 0) {
+    if (count == 0) {
         try w.writeAll(
             \\<div class="empty">
             \\<h2>No requests captured yet</h2>
-            \\<p>Send any HTTP request to this server — for example:</p>
+            \\<p>Send any HTTP request to a path under this bin:</p>
             \\<br>
-            \\<code>curl -X POST http://localhost:8080/test -d '{"hello":"world"}' -H 'Content-Type: application/json'</code>
-            \\</div>
+            \\<code>curl -X POST http://localhost:8080/
         );
+        try w.writeAll(bin_id);
+        try w.writeAll("/webhook -d '{\"hello\":\"world\"}'</code></div>");
     } else {
         var i: usize = state.requests.items.len;
         while (i > 0) {
             i -= 1;
-            try renderCard(w, &state.requests.items[i]);
+            const r = &state.requests.items[i];
+            if (std.mem.eql(u8, r.bin_id, bin_id)) {
+                try renderCard(w, r);
+            }
         }
     }
 
@@ -392,8 +529,21 @@ fn loadRequests(state: *State) !void {
         if (req.id >= state.next_id) state.next_id = req.id + 1;
     }
 
-    while (state.requests.items.len > max_requests) {
-        _ = state.requests.orderedRemove(0);
+    // Apply per-bin cap: collect unique bin IDs then cap each
+    var seen_bins: std.ArrayList([]const u8) = .empty;
+    defer seen_bins.deinit(state.gpa);
+    for (state.requests.items) |r| {
+        var found = false;
+        for (seen_bins.items) |b| {
+            if (std.mem.eql(u8, b, r.bin_id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) try seen_bins.append(state.gpa, r.bin_id);
+    }
+    for (seen_bins.items) |b| {
+        capBin(state, b);
     }
 }
 
@@ -420,6 +570,7 @@ fn parseStoredRequest(arena: std.mem.Allocator, gpa: std.mem.Allocator, line: []
 
     return .{
         .id = v.id,
+        .bin_id = try arena.dupe(u8, v.bin_id),
         .method = try arena.dupe(u8, v.method),
         .path = try arena.dupe(u8, v.path),
         .headers = try header_list.toOwnedSlice(arena),
@@ -442,6 +593,7 @@ fn appendRequestToLog(state: *const State, req: *const CapturedRequest) !void {
 
     const ser = SerializedRequest{
         .id = req.id,
+        .bin_id = req.bin_id,
         .method = req.method,
         .path = req.path,
         .headers = ser_headers,
@@ -469,12 +621,14 @@ fn appendRequestToLog(state: *const State, req: *const CapturedRequest) !void {
 
 const testing = std.testing;
 
+const test_bin = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
 fn testState(arena: std.mem.Allocator) State {
     return .{
         .io = std.testing.io,
         .arena = arena,
         .gpa = testing.allocator,
-        .data_path = "", // empty → appendRequestToLog fails silently, no disk I/O
+        .data_path = "",
     };
 }
 
@@ -488,10 +642,23 @@ fn testRequest(state: *State, raw: []const u8) !std.Io.Writer.Allocating {
     return out;
 }
 
+test "isValidBinId: accepts valid UUIDs" {
+    try testing.expect(isValidBinId("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+    try testing.expect(isValidBinId("00000000-0000-4000-8000-000000000000"));
+    try testing.expect(isValidBinId("f47ac10b-58cc-4372-a567-0e02b2c3d479"));
+}
+
+test "isValidBinId: rejects invalid formats" {
+    try testing.expect(!isValidBinId("not-a-uuid"));
+    try testing.expect(!isValidBinId("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee")); // 35 chars
+    try testing.expect(!isValidBinId("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeeee")); // 37 chars
+    try testing.expect(!isValidBinId("aaaaaaaa_bbbb_4ccc_8ddd_eeeeeeeeeeee")); // underscores
+    try testing.expect(!isValidBinId("gggggggg-bbbb-4ccc-8ddd-eeeeeeeeeeee")); // 'g' not hex
+}
+
 test "looksLikeJson: content-type detection" {
     try testing.expect(looksLikeJson("application/json", ""));
     try testing.expect(looksLikeJson("application/vnd.api+json", ""));
-    // non-json content-type falls through to body heuristic
     try testing.expect(!looksLikeJson("text/plain", "hello"));
     try testing.expect(!looksLikeJson("text/html", "not json"));
 }
@@ -532,7 +699,7 @@ test "writeHtmlEscaped: special characters" {
     try testing.expectEqualStrings("&lt;b&gt;&amp;&quot;x&quot;&lt;/b&gt;", out.written());
 }
 
-test "GET / returns 200 with HTML" {
+test "GET / returns landing page" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var state = testState(arena.allocator());
@@ -541,6 +708,19 @@ test "GET / returns 200 with HTML" {
     const resp = out.written();
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.indexOf(u8, resp, "PostBin") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "Create New Bin") != null);
+}
+
+test "GET /<uuid> returns bin UI" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = testState(arena.allocator());
+    var out = try testRequest(&state, "GET /" ++ test_bin ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer out.deinit();
+    const resp = out.written();
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, resp, test_bin) != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "No requests captured yet") != null);
 }
 
 test "GET /favicon.ico returns image/x-icon" {
@@ -554,12 +734,21 @@ test "GET /favicon.ico returns image/x-icon" {
     try testing.expect(std.mem.indexOf(u8, resp, "image/x-icon") != null);
 }
 
-test "POST captures method, path, and body" {
+test "non-UUID path returns 404" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = testState(arena.allocator());
+    var out = try testRequest(&state, "GET /webhook HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer out.deinit();
+    try testing.expect(std.mem.startsWith(u8, out.written(), "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "POST /<uuid>/path captures request for bin" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var state = testState(arena.allocator());
     const raw =
-        "POST /webhook HTTP/1.1\r\n" ++
+        "POST /" ++ test_bin ++ "/webhook HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
         "Content-Length: 5\r\n" ++
         "\r\n" ++
@@ -570,7 +759,8 @@ test "POST captures method, path, and body" {
     try testing.expectEqual(@as(usize, 1), state.requests.items.len);
     const captured = state.requests.items[0];
     try testing.expectEqualStrings("POST", captured.method);
-    try testing.expectEqualStrings("/webhook", captured.path);
+    try testing.expectEqualStrings("/" ++ test_bin ++ "/webhook", captured.path);
+    try testing.expectEqualStrings(test_bin, captured.bin_id);
     try testing.expectEqualStrings("hello", captured.body);
 }
 
@@ -579,7 +769,7 @@ test "POST with JSON content-type is detected" {
     defer arena.deinit();
     var state = testState(arena.allocator());
     const raw =
-        "POST /api HTTP/1.1\r\n" ++
+        "POST /" ++ test_bin ++ "/api HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
         "Content-Type: application/json\r\n" ++
         "Content-Length: 7\r\n" ++
@@ -591,4 +781,29 @@ test "POST with JSON content-type is detected" {
     const captured = state.requests.items[0];
     try testing.expect(captured.is_json);
     try testing.expect(std.mem.indexOfScalar(u8, captured.pretty_body, '\n') != null);
+}
+
+test "bin UI only shows its own requests" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = testState(arena.allocator());
+
+    const bin_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const bin_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    var r1 = try testRequest(&state, "POST /" ++ bin_a ++ "/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\na");
+    defer r1.deinit();
+    var r2 = try testRequest(&state, "POST /" ++ bin_b ++ "/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nb");
+    defer r2.deinit();
+
+    try testing.expectEqual(@as(usize, 2), state.requests.items.len);
+
+    // Bin A's UI shows 1 request
+    var out = try testRequest(&state, "GET /" ++ bin_a ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer out.deinit();
+    const html = out.written();
+    try testing.expect(std.mem.indexOf(u8, html, "1 request") != null);
+    // Bin A's path appears; bin B's path does not appear in rendered cards
+    try testing.expect(std.mem.indexOf(u8, html, "/" ++ bin_a ++ "/x") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "/" ++ bin_b ++ "/x") == null);
 }
