@@ -323,3 +323,122 @@ fn prettyJson(arena: std.mem.Allocator, input: []const u8) ![]const u8 {
     defer parsed.deinit();
     return try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
 }
+
+// ---- Tests ---------------------------------------------------------------
+
+const testing = std.testing;
+
+fn testRequest(state: *State, raw: []const u8) !std.Io.Writer.Allocating {
+    var reader = std.Io.Reader.fixed(raw);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer out.deinit();
+    var srv = http.Server.init(&reader, &out.writer);
+    var req = try srv.receiveHead();
+    try handleRequest(state, &req);
+    return out;
+}
+
+test "looksLikeJson: content-type detection" {
+    try testing.expect(looksLikeJson("application/json", ""));
+    try testing.expect(looksLikeJson("application/vnd.api+json", ""));
+    // non-json content-type falls through to body heuristic
+    try testing.expect(!looksLikeJson("text/plain", "hello"));
+    try testing.expect(!looksLikeJson("text/html", "not json"));
+}
+
+test "looksLikeJson: body heuristic" {
+    try testing.expect(looksLikeJson(null, "{}"));
+    try testing.expect(looksLikeJson(null, "[]"));
+    try testing.expect(looksLikeJson(null, "  { }  "));
+    try testing.expect(!looksLikeJson(null, "hello world"));
+    try testing.expect(!looksLikeJson(null, ""));
+}
+
+test "prettyJson: formats valid JSON" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try prettyJson(arena.allocator(), "{\"a\":1}");
+    try testing.expect(std.mem.indexOfScalar(u8, result, '\n') != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"a\"") != null);
+}
+
+test "prettyJson: error on invalid input" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.SyntaxError, prettyJson(arena.allocator(), "not json"));
+}
+
+test "writeHtmlEscaped: plain text passthrough" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeHtmlEscaped(&out.writer, "hello world");
+    try testing.expectEqualStrings("hello world", out.written());
+}
+
+test "writeHtmlEscaped: special characters" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeHtmlEscaped(&out.writer, "<b>&\"x\"</b>");
+    try testing.expectEqualStrings("&lt;b&gt;&amp;&quot;x&quot;&lt;/b&gt;", out.written());
+}
+
+test "GET / returns 200 with HTML" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = State{ .arena = arena.allocator() };
+    var out = try testRequest(&state, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer out.deinit();
+    const resp = out.written();
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, resp, "PostBin") != null);
+}
+
+test "GET /favicon.ico returns image/x-icon" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = State{ .arena = arena.allocator() };
+    var out = try testRequest(&state, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer out.deinit();
+    const resp = out.written();
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, resp, "image/x-icon") != null);
+}
+
+test "POST captures method, path, and body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = State{ .arena = arena.allocator() };
+    const raw =
+        "POST /webhook HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "hello";
+    var out = try testRequest(&state, raw);
+    defer out.deinit();
+    try testing.expect(std.mem.indexOf(u8, out.written(), "Captured!") != null);
+    try testing.expectEqual(@as(usize, 1), state.requests.items.len);
+    const captured = state.requests.items[0];
+    try testing.expectEqualStrings("POST", captured.method);
+    try testing.expectEqualStrings("/webhook", captured.path);
+    try testing.expectEqualStrings("hello", captured.body);
+}
+
+test "POST with JSON content-type is detected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var state = State{ .arena = arena.allocator() };
+    const raw =
+        "POST /api HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Content-Length: 7\r\n" ++
+        "\r\n" ++
+        "{\"x\":1}";
+    var out = try testRequest(&state, raw);
+    defer out.deinit();
+    try testing.expectEqual(@as(usize, 1), state.requests.items.len);
+    const captured = state.requests.items[0];
+    try testing.expect(captured.is_json);
+    try testing.expect(std.mem.indexOfScalar(u8, captured.pretty_body, '\n') != null);
+}
