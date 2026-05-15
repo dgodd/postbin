@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "zircote-lsp": {
+      "source": {
+        "source": "github",
+        "repo": "zircote/lsp-marketplace"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "zig-lsp@zircote-lsp": true
+  }
+}
